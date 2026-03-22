@@ -20,6 +20,8 @@ enum Particle {
   pion = 3,
   other = 4
 };
+
+// set useful constant values
 int nCubletsX = 10, nCubletsY = 10, nCubletsZ = 10;
 int nCellsXY = 10;
 int nCellsZ  = 10;
@@ -27,6 +29,13 @@ double cellSizeXY = 3; //mm
 double cellSizeZ  = 12; //mm
 double deltaE_vtx_thr = -50e3; // MeV, threshold of energy loss to be considered
                                // primary vertex of the event
+int n_sensors = nCellsXY*nCellsZ;
+int nCublets = nCubletsX*nCubletsY*nCubletsZ;
+double lightyield = 200; // ph/MeV 
+double max_t = 20; // ns
+double dt = 0.2; // ns
+int timesteps = max_t/dt;
+
 
 // input tree variables
 int i_evt;
@@ -39,25 +48,79 @@ vector<int>*    cublet_idx;
 vector<int>*    cell_idx;
 
 
+
+vector<float> read_matrices(string filename){
+    // Step 1: Read the shape from the text file
+    ifstream shape_file("shape.txt");
+    vector<size_t> shape;
+    if (shape_file.is_open()) {
+      string line;
+      getline(shape_file, line);
+      istringstream iss(line);
+      size_t dim;
+      while (iss >> dim) {
+          shape.push_back(dim);
+      }
+    }
+    else {
+      cerr << "Failed to open shape.txt" << endl;
+    }
+
+    // Step 2: Calculate the total number of elements
+    size_t total_elements = 1;
+    for(size_t dim : shape){
+      total_elements *= dim;
+    }
+
+    // Step 3: Read the binary data
+    ifstream binary_file(filename, ios::binary);
+    if (!binary_file.is_open()) {
+      cerr << "Failed to open tensor.bin" << endl;
+    }
+
+    vector<float> data(total_elements);  // Assuming float32 data type
+    binary_file.read(reinterpret_cast<char*>(data.data()), total_elements * sizeof(float));
+
+    return data;
+}
+
+int total_reflections(int n){
+  vector<int> extra_points;
+  for(int i = 0; i < n+1; i++){
+    switch(i){
+      case 0:
+        extra_points.push_back(1);
+        break;
+      case 1:
+        extra_points.push_back(5);
+        break;
+      default:
+        extra_points.push_back(4*(2*i-1));
+    }
+  }
+
+  int total_points = 0;
+  for(int i = 0; i < extra_points.size(); i++){
+    total_points += extra_points[i];
+  }
+
+  return total_points;
+}
+
+
 void genPhotonTree(string filename, string treename, string outputFilePath,
-                   vector<vector<vector<double>>> angle_matrix,
-                   vector<vector<vector<double>>> time_matrix,
+                   vector<float>& emission_matrix, int max_N,
                    int verbose=0, bool primary_only=true, int max_event=1000) {
 
   auto start_time = std::chrono::high_resolution_clock::now();
 
+  int total_points = total_reflections(max_N);
+  vector<int> shape{nCellsXY, nCellsXY, nCellsZ, total_reflections(5), nCellsXY, nCellsZ, 2};
+  int dims = shape.size();
+
   size_t name_start = filename.find_last_of('/');
   size_t name_end   = filename.find_last_of('.');
   string name = filename.substr(name_start+1, name_end-name_start-1);
-
-  // set useful constant values
-  int n_sensors = nCellsXY*nCellsZ;
-  int nCublets = nCubletsX*nCubletsY*nCubletsZ;
-  double lightyield = 200; // ph/MeV 
-  double max_t = 20; // ns
-  double dt = 0.2; // ns
-  int timesteps = max_t/dt;
-
 
   // get simulation results tree from file
   TFile* file = TFile::Open(filename.c_str()); 
@@ -76,13 +139,14 @@ void genPhotonTree(string filename, string treename, string outputFilePath,
   vector<vector<vector<int>>> photon_matrix(nCublets,  vector<vector<int>>(
                                             timesteps, vector<int>(
                                             n_sensors, 0)));
-  vector<double> dEmax(nCublets, 0.0);        // maximum energy diff between step beginning and end...
-  vector<double> Etot(nCublets, 0.0);         // total energy released...
-  vector<double> sigmaE(nCublets, 0.0);       // (weighted) energy dispersion...
-  vector<Particle> p(nCublets, unclassified); // particle classification...
-  vector<int> Nint(nCublets, 0);              // number of interactions...
-  vector<int> pdg_max(nCublets, 0);           // pdg encoding of primary particle...
-                                              // per cublet 
+  vector<double> dEmax(nCublets, 0.0);                   // maximum energy diff between step beginning and end...
+  vector<double> Etot(nCublets, 0.0);                    // total energy released...
+  vector<TVector3> Ecentroid(nCublets, TVector3(0,0,0)); // (weighted) centroid of energy depositions...
+  vector<TVector3> sigmaE(nCublets,    TVector3(0,0,0)); // (weighted) energy dispersion along x, y and z...
+  vector<Particle> p(nCublets, unclassified);            // particle classification...
+  vector<int> Nint(nCublets, 0);                         // number of interactions...
+  vector<int> pdg_max(nCublets, 0);                      // pdg encoding of primary particle...
+                                                         // per cublet 
 
   ofstream outfile;
   if(primary_only){
@@ -112,12 +176,13 @@ void genPhotonTree(string filename, string treename, string outputFilePath,
         fill(timestep.begin(), timestep.end(), 0.0);
       }
     }
-    fill(dEmax.begin(),   dEmax.end(),   0.0);
-    fill(Etot.begin(),    Etot.end(),    0.0);
-    fill(sigmaE.begin(),  sigmaE.end(),  0.0);
-    fill(p.begin(),       p.end(),       unclassified);
-    fill(Nint.begin(),    Nint.end(),    0);
-    fill(pdg_max.begin(), pdg_max.end(), 0);
+    fill(dEmax.begin(),     dEmax.end(),     0.0);
+    fill(Etot.begin(),      Etot.end(),      0.0);
+    fill(Ecentroid.begin(), Ecentroid.end(), TVector3(0,0,0));
+    fill(sigmaE.begin(),    sigmaE.end(),    TVector3(0,0,0));
+    fill(p.begin(),         p.end(),         unclassified);
+    fill(Nint.begin(),      Nint.end(),      0);
+    fill(pdg_max.begin(),   pdg_max.end(),   0);
 
     // primary vertex identification variables
     double dE_primary = 0;
@@ -181,28 +246,70 @@ void genPhotonTree(string filename, string treename, string outputFilePath,
         int z_idx =  cell_i/(nCellsXY*nCellsXY);           // i/(x*y)
         int y_idx = (cell_i%(nCellsXY*nCellsXY))/nCellsXY; // (i%(x*y))/x
         int x_idx =  cell_i%nCellsXY;                      // i%x
+
+        // update centroid
+        Ecentroid[cub_i].SetXYZ(Ecentroid[cub_i].X() + x_idx*E,
+                                Ecentroid[cub_i].Y() + y_idx*E,
+                                Ecentroid[cub_i].Z() + z_idx*E);
         
+        // compute photon arriving to sensors
         double ph_emitted = E*lightyield;
 
-        // loop over sensors
-        for (int i_sz = 0; i_sz < nCellsZ; i_sz++) {
+        // loop over sensors 
+        int chunk_size = total_points*shape[dims-3]*shape[dims-2]*shape[dims-1];
+        vector<float> cached_chunk(chunk_size);
+        int chunk_start = z_idx * shape[dims-4]*shape[dims-3]*shape[dims-2]*shape[dims-1] +
+                          y_idx * shape[dims-5]*shape[dims-4]*shape[dims-3]*shape[dims-2]*shape[dims-1] +
+                          x_idx * shape[dims-6]*shape[dims-5]*shape[dims-4]*shape[dims-3]*shape[dims-2]*shape[dims-1];
+        std::copy(emission_matrix.begin() + chunk_start,
+                  emission_matrix.begin() + chunk_start + chunk_size,
+                  cached_chunk.begin());
+        for(int n = 0; n < total_points; n++){
           for (int i_sx = 0; i_sx < nCellsXY; i_sx++) {
-            int sensor_i = i_sz*nCellsXY+i_sx;
-            int n_photon = round(ph_emitted*angle_matrix[abs(i_sx - x_idx)][y_idx][abs(i_sz - z_idx)]);
-            double time = (t0+time_matrix[abs(i_sx - x_idx)][y_idx][abs(i_sz - z_idx)]);
-            int step = time/dt;
-            if(time < max_t) {
-              photon_matrix[cub_i][step][sensor_i] += n_photon;
+            for (int i_sz = 0; i_sz < nCellsZ; i_sz++) {
+              int sensor_i = i_sz*nCellsXY+i_sx;
+              int idx = i_sz * shape[dims-1] +
+                        i_sx * shape[dims-2]*shape[dims-1] +
+                        n    * shape[dims-3]*shape[dims-2]*shape[dims-1];
+              int n_photon = round(ph_emitted*cached_chunk[idx]);
+              double time = (t0+cached_chunk[idx+1]);
+              int step = time/dt;
+              if(time < max_t) {
+                photon_matrix[cub_i][step][sensor_i] += n_photon;
+              }
             }
           }
         }
-
-        // compute energy dispersion
-        sigmaE[cub_i] += (pow(x_idx - (nCellsXY-1.)/2, 2) + 
-                          pow(y_idx - (nCellsXY-1.)/2, 2))*E;
       }
     }
-    
+
+    // correct centroid estimation
+    for(int i_cub = 0; i_cub < nCublets; i_cub++) {
+      if(!(Etot[i_cub] > 0)) continue;
+      Ecentroid[i_cub].SetXYZ(Ecentroid[i_cub].X()/Etot[i_cub],
+                              Ecentroid[i_cub].Y()/Etot[i_cub],
+                              Ecentroid[i_cub].Z()/Etot[i_cub]);
+    }
+
+    // compute energy dispersions
+    for (int j = 0; j < n_int; j++) {
+      int cub_i = (*cublet_idx)[j];
+
+      // check if energy has been released in the cublet, otherwise skip
+      if((primary_only && (cub_i != primary_peak_cub)) || !(Etot[cub_i] > 0)) continue;
+      
+      double E  = (*edep)[j];
+      int cell_i = (*cell_idx)[j];
+      int z_idx =  cell_i/(nCellsXY*nCellsXY);           // i/(x*y)
+      int y_idx = (cell_i%(nCellsXY*nCellsXY))/nCellsXY; // (i%(x*y))/x
+      int x_idx =  cell_i%nCellsXY;                      // i%x
+      
+      // update energy dispersion vector
+      sigmaE[cub_i].SetXYZ(sigmaE[cub_i].X() + pow(x_idx - Ecentroid[cub_i].X(), 2)*E,
+                           sigmaE[cub_i].Y() + pow(y_idx - Ecentroid[cub_i].Y(), 2)*E,
+                           sigmaE[cub_i].Z() + pow(z_idx - Ecentroid[cub_i].Z(), 2)*E);
+    }
+
     // save photon counts to file
     if(!primary_only){
       outfile.open(outputFilePath + name + "_" + to_string(i) + ".dat", std::ios::binary);
@@ -239,10 +346,22 @@ void genPhotonTree(string filename, string treename, string outputFilePath,
 
       // total energy
       outfile.write(reinterpret_cast<char*>(&Etot[i_cub]), sizeof(Etot[i_cub]));
+      
+      // energy centroid
+      double x = Ecentroid[i_cub].X();
+      double y = Ecentroid[i_cub].Y();
+      double z = Ecentroid[i_cub].Z();
+      outfile.write(reinterpret_cast<char*>(&x), sizeof(x));
+      outfile.write(reinterpret_cast<char*>(&y), sizeof(y));
+      outfile.write(reinterpret_cast<char*>(&z), sizeof(z));
 
       // energy dispersion
-      sigmaE[i_cub] /= Etot[i_cub];
-      outfile.write(reinterpret_cast<char*>(&sigmaE[i_cub]), sizeof(sigmaE[i_cub]));
+      double sX = sigmaE[i_cub].X()/Etot[i_cub];
+      double sY = sigmaE[i_cub].Y()/Etot[i_cub];
+      double sZ = sigmaE[i_cub].Z()/Etot[i_cub];
+      outfile.write(reinterpret_cast<char*>(&sX), sizeof(sX));
+      outfile.write(reinterpret_cast<char*>(&sY), sizeof(sY));
+      outfile.write(reinterpret_cast<char*>(&sZ), sizeof(sZ));
 
       // number of interactions
       outfile.write(reinterpret_cast<char*>(&Nint[i_cub]), sizeof(Nint[i_cub]));
@@ -285,6 +404,7 @@ void genPhotonTree(string filename, string treename, string outputFilePath,
   
   return;
 }
+
 
 
 
@@ -361,6 +481,7 @@ int main(int argc, char* argv[]) {
   int verbose = 0;
   bool primary_only = false;
   int max_event = 1000;
+  int reflections = 0;
   for (int i = 1; i < argc; i++) {
     std::string flag(argv[i]);
 
@@ -402,6 +523,14 @@ int main(int argc, char* argv[]) {
       i += 1;
       max_event = std::stoi(argv[i]);
     }
+    
+    else if (flag.find("reflections") != string::npos) {
+      reflections = std::stoi(flag.substr(14));
+    }
+    else if (flag=="-r") {
+      i += 1;
+      reflections = std::stoi(argv[i]);
+    }
   }
 
   if(fileName == "") {
@@ -413,17 +542,24 @@ int main(int argc, char* argv[]) {
     outputFilePath += '/';
   }
 
-  cout << "Computing matrices..." << endl;
-  vector<vector<vector<vector<double>>>> matrices = create_matrices(cellSizeXY, cellSizeXY, cellSizeZ,
-                                                                    nCellsXY,   nCellsXY,   nCellsZ);
+  /*
+  if(reflections == 0){
+    cout << "Computing matrices..." << endl;
+    vector<vector<vector<vector<double>>>> matrices = create_matrices(cellSizeXY, cellSizeXY, cellSizeZ,
+                                                                      nCellsXY,   nCellsXY,   nCellsZ);
+  }
+  */
+
+  cout << "Reading matrices..." << endl;
+  vector<float> emission_matrix = read_matrices("emission_matrix.bin");
+
   cout << "Timing and solid angle matrices computed.\n"
        << "\n---------------------------------------\n\n"
        << "Analyzing file " << fileName << ":" << endl;
 
 
-
-  genPhotonTree(fileName, "outputTree", outputFilePath, matrices[0],
-                matrices[1], verbose, primary_only, max_event);
+  genPhotonTree(fileName, "outputTree", outputFilePath, emission_matrix,
+                reflections, verbose, primary_only, max_event);
 
 	cout << "File processing completed." << endl;
 

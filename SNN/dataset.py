@@ -1,35 +1,11 @@
 import numpy as np
 import math
-
 import struct
 import os
-
-import snntorch as snn
 import torch
-import torch.nn as nn
-
-import snntorch.spikeplot as splt
-from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader, random_split
-from torchmetrics.classification import MulticlassConfusionMatrix
-
-from snntorch import surrogate
-import snntorch.functional as SF
+from collections.abc import Iterable
 import torch.nn.functional as F
-from torch.nn import NLLLoss, LogSoftmax
-
-from snntorch import spikegen
-
-import matplotlib.pyplot as plt
-from matplotlib.colors import SymLogNorm
-import snntorch.spikeplot as splt
-import imageio
-
-from sklearn.metrics import ConfusionMatrixDisplay
-
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-
 ###############################################################################
 
 
@@ -43,21 +19,34 @@ timesteps = int(max_t/dt)
 ###############################################################################
 
 
-def readfile(filename, primary_only):
+def readfile(filename, primary_only, merged = True):
 
   ph_list = []
   E_list  = []
+  ct_list = []
   sE_list = []
   N_list  = []
   p_class = []
+  cublet_id = []
+  event_id = []
+
   if not primary_only:
     primary_list = []
 
-  with open(filename, 'rb') as file:
+  delimiter = b'EOE '
 
+  with open(filename, 'rb') as file:
+    event = 1
     data = file.read(4)
     while data:
-    
+      if data == delimiter:
+        event = struct.unpack('i', file.read(4))[0]
+        data = file.read(4)
+
+        if not data:
+            break
+        continue
+
       ph_matrix = np.zeros(shape=(timesteps, nSensors), dtype=np.int32)
 
       # read photon count data
@@ -75,13 +64,22 @@ def readfile(filename, primary_only):
       ph_list.append(ph_matrix)
 
       # Read cublet_id
-      cublet_id = struct.unpack('i', file.read(4))[0]
-      
+      cublet_id.append(struct.unpack('i', file.read(4))[0])
+
       # Read total energy released
       E_list.append(struct.unpack('d', file.read(8))[0])
       
+      # Read energy centroid
+      x = struct.unpack('d', file.read(8))[0]
+      y = struct.unpack('d', file.read(8))[0]
+      z = struct.unpack('d', file.read(8))[0]
+      ct_list.append((x,y,z))
+      
       # Read energy dispersion
-      sE_list.append(struct.unpack('d', file.read(8))[0])
+      sX = struct.unpack('d', file.read(8))[0]
+      sY = struct.unpack('d', file.read(8))[0]
+      sZ = struct.unpack('d', file.read(8))[0]
+      sE_list.append((sX, sY, sZ))
     
       # Read number of interactions
       N_list.append(struct.unpack('i', file.read(4))[0])
@@ -92,10 +90,17 @@ def readfile(filename, primary_only):
       # Read primary vertex indicator
       if not primary_only:
         primary_list.append(struct.unpack('i', file.read(4))[0])
-
+      
+      if merged: 
+        event_id.append(event)
+      
       data = file.read(4)
 
-  res = [ph_list, E_list, sE_list, N_list, p_class]
+  res = [ph_list, E_list, ct_list, sE_list, N_list, p_class, cublet_id]
+
+  if merged:
+    res.append(event_id)
+    
   if not primary_only:
     res.append(primary_list)
 
@@ -103,6 +108,7 @@ def readfile(filename, primary_only):
 
 
 ###############################################################################
+
 
 
 # converts to Torch tensor of desired type
@@ -119,13 +125,15 @@ def to_tensor_and_dtype(input, target_dtype=torch.float32):
     return input
 
 class CustomDataset(Dataset):
-    def __init__(self, filelist, primary_only=True, target="energy", transform=None):
+    def __init__(self, filelist, primary_only=True, target="energy",transform=None):
         
         targets_dict = {
             "energy":1,
-            "dispersion":2,
-            "N_int":3,
-            "particle":4
+            "centroid":2,
+            "dispersion":3,
+            "N_int":4,
+            "particle":5,
+            "primary":6
         }
         
         samples = []
@@ -133,10 +141,15 @@ class CustomDataset(Dataset):
         for file in filelist:
             info = readfile(file, primary_only)
             samples += info[0]
-            targets += info[targets_dict[target]]
+
+            if isinstance(target, Iterable) and not isinstance(target, (str, bytes)):
+                temp = [info[targets_dict[key]] for key in target]
+                targets += list(zip(*temp))
+            else:
+                targets += info[targets_dict[target]]
 
         samples = to_tensor_and_dtype(np.array(samples))
-        #targets = F.one_hot(torch.tensor(targets)-1, nClasses)
+        targets = to_tensor_and_dtype(targets, target_dtype = torch.int64)
 
         self.data = list(zip(samples, targets))
         self.transform = transform
@@ -144,23 +157,43 @@ class CustomDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
-        if isinstance(idx, slice):
-            return [self.__getitem__(i) for i in range(*index.indices(len(self)))]  # type: ignore
-        if isinstance(idx, (list, np.ndarray)):
-            return [self.__getitem__(i) for i in idx]
+    def __getitem__(self, idx): 
 
-        sample = self.data[idx]
-        if self.transform:
-            sample = self.transform(sample)
-            
-        return sample
+        if isinstance(idx, slice):
+            return [self.__getitem__(i) for i in range(*idx.indices(len(self)))]  # Slicing directly
+        
+        if isinstance(idx, (list, np.ndarray)):
+            if (isinstance(idx, np.ndarray) and idx.dtype == bool) or \
+               (isinstance(idx, list)       and all(isinstance(item, bool) for item in idx)):  # Boolean mask
+                if len(idx) != len(self.data):
+                    raise ValueError("Boolean mask must have the same length as the dataset")
+                return [self.__getitem__(i) for i, mask in enumerate(idx) if mask]
+            return [self.__getitem__(i) for i in idx]  # Indexing with list or array
+        
+        if isinstance(idx, (int, np.int64, torch.int64)):
+            sample = self.data[idx]
+            if self.transform:
+                sample = self.transform(sample)
+            return sample
+        
+        raise TypeError("Invalid index type: {}".format(type(idx)))
+
+    def clean(self, selection_fn):
+        """
+        Filters the dataset by applying a selection function to each sample.
+
+        Args:
+            selection_fn (callable): A function that takes a single sample as input
+                                     (sample, target) and returns a boolean indicating
+                                     whether to keep the sample.
+        """
+        self.data = [sample for sample in self.data if selection_fn(sample)]
     
 
 ###############################################################################
 
 
-def build_dataset(path, split=0.8, val=True, max_files=50, *args, **kwargs):
+def build_dataset(path, max_files=50, *args, **kwargs):
     
     filelist = []
 
@@ -170,17 +203,36 @@ def build_dataset(path, split=0.8, val=True, max_files=50, *args, **kwargs):
             filelist += [os.path.join(path, subdir_name, f) for f in files[:max_files]]
 
     dataset = CustomDataset(filelist, *args, **kwargs)
-    
-    train_size = int(len(dataset)*split)
-    test_size = len(dataset)-train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-    if val:
-        val_size = int(train_size*(1-split))
-        train_size -= val_size
-        train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
-        return train_dataset, test_dataset, val_dataset
+    return dataset
+
     
+def build_loaders(dataset, split=(0.6, 0.2), batch_size=50, *args, **kwargs):
+    
+    if isinstance(split, Iterable) and not isinstance(split, (str, bytes)):
+        if len(split) > 2:
+            raise ValueError("Split should be provided for training and validation datasets")
+        if sum(split) > 1:
+            raise ValueError("Split fractions should sum up to 1 at most")
+        train_size = int(len(dataset)*split[0])
+        try:
+            val_size = int(len(dataset)*split[1])
+        except:
+            val_size = 0
+        test_size = len(dataset) - train_size - val_size
     else:
-        return train_dataset, test_dataset
+        train_size = int(len(dataset)*split)
+        test_size = len(dataset) - train_size
+        val_size = 0
+
+    train_dataset, test_dataset, val_dataset = random_split(dataset, [train_size, test_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, *args, **kwargs)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, *args, **kwargs)
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, *args, **kwargs)
+        return train_loader, test_loader, val_loader
+    
+    return train_loader, test_loader
+    
 
