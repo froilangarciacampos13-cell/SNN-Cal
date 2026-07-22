@@ -1,22 +1,72 @@
-# Neuromorphic Readout for Hadronic Calorimeters
+# Neuromorphic Readout for Hadron Calorimeters — SNN Reconstruction Pipeline
 
+Spiking Neural Networks (SNNs) for **transduction-less readout of hadronic
+calorimeters**: reconstructing shower observables directly from the temporal
+photon-scintillation signals of a homogeneous PbWO₄ calorimeter.
 
-## How to Run 
+This repository is part of a research collaboration extending the paper
+[*Neuromorphic Readout for Hadron Calorimeters*](https://arxiv.org/abs/2502.12693)
+(Lupi et al., 2025). It contains my Bachelor's-thesis contribution to that
+effort.
 
-Here is a quick overview of the necessary steps to take in order to run the code contained in this repository. This is not meant to be an exhaustive overview, merely a simple list of instructions for the less tech-savvy audience.
+---
 
-### Get this Repository on your System
-First, get a local copy of this repository so that you can run and modify it as you wish. In order to do that, I suggest first [forking](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo) it so that you have your own personal version of it, and then [clone](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) it locally on your computer.
+## My contribution — `tests_diego/`
 
-> **WARNING!**: The main branch is currently not updated! Please use the *lin_model* branch to enjoy all the functionalities.
+A complete, reproducible SNN pipeline that reconstructs, **per event**, the
+deposited energy and the 3D energy centroid of a shower in a PbWO₄ calorimeter
+segmented into a 10×10×10 grid of cubelets (100 sensors), from raw
+photon-scintillation data.
 
+This pipeline was contributed to the collaboration's repository, reviewed, and
+**integrated into the upstream project** (June 2026) — see
+[PR #1](https://github.com/a-saborido/SNN-Cal/pull/1).
 
-### Set up the Python Environment
+**→ Full documentation and usage: [`tests_diego/README.md`](tests_diego/README.md)**
 
-Second, make sure you have all the packages necessary to run the code. I suggest using a package and environment manager like Anaconda. 
+Three stages, run in order:
 
-#### Install Miniconda
-Install Miniconda on your system, following the information detailed on [this page](https://docs.anaconda.com/miniconda/install/). You can do it easily using these commands on a Linux machine:
+```
+generate_dataset.py   →   train_model.py   →   print_predictions.py
+   (raw → .pt)              (.pt → .pth)         (.pt + .pth → metrics/plots)
+```
+
+Highlights:
+
+- **Regression targets:** deposited energy (in `log10(E/MeV)`), spatial centroid
+  `(x_c, y_c, z_c)` and dispersion — configurable per run.
+- **Learned encoding:** the SNN encoder learns per-threshold exponents that map
+  scintillation signals to spike trains.
+- **Radial sectioning study:** the detector can be carved into regions (e.g. an
+  inner cylinder vs. its complement) to compare a global model against
+  region-specific ones.
+- **Rigorous evaluation:** fixed-seed 70/15/15 train/val/test split and a
+  figures-of-merit table per target (Pearson r, R², RMSE, MAE, bias, residual
+  variance), plus deep diagnostics — binned bias/variance profiles, empirical
+  vs. expected CDFs, per-neuron spike activity.
+
+Built with **PyTorch** and **snnTorch** (NumPy, Matplotlib, SciPy,
+scikit-learn).
+
+---
+
+## Setup
+
+The pipeline runs on Python with `torch`, `snntorch`, `numpy`, `matplotlib`,
+`scipy`, `pandas`, `scikit-learn` and `tqdm`. Using a package/environment manager
+such as Anaconda is recommended.
+
+### 1. Get the repository
+
+[Fork](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/fork-a-repo)
+this repository to get your own copy, then
+[clone](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository)
+it locally.
+
+### 2. Install Miniconda
+
+Follow the official [installation guide](https://docs.anaconda.com/miniconda/install/).
+On a Linux machine:
 
 ```bash
 mkdir -p ~/miniconda3
@@ -27,9 +77,34 @@ source ~/miniconda3/bin/activate
 conda init --all
 ```
 
-#### Create the Conda Env
-Generate a conda environment ([here](https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html) is a list of commands you can use) and download the necessary packages, in particular *numpy*, *PyTorch*, *snnTorch* and *Jupyter Notebook*. <br> If you want the exact environment that I used, run the following command:
+### 3. Create the environment
+
+For the exact environment used in this project (`numpy`, `PyTorch`, `snnTorch`,
+Jupyter and the rest):
+
 ```bash
-conda env create -f env/environmental_droplet.yml
+conda env create -f env/environmental_droplet.yml   # creates the snn_hgcal env
 ```
-to create the *snn_hgcal* environment with all the needed components.
+
+Then follow the step-by-step run instructions in
+[`tests_diego/README.md`](tests_diego/README.md).
+
+---
+
+## Repository layout
+
+| Path | Content |
+|------|---------|
+| `tests_diego/` | **My contribution** — the full reconstruction pipeline (see its README) |
+| `SNN/` | Core neuromorphic-computing modules |
+| `GenerateDataset/` | Dataset-creation scripts |
+| `Data/` | Datasets |
+| `env/` | Conda environment specification |
+
+---
+
+*Physics context: PbWO₄ (lead tungstate) is a homogeneous scintillating
+calorimeter medium; "transduction-less" readout means inferring shower
+observables directly from the light signal, without an intermediate segmented
+active medium. See the [paper](https://arxiv.org/abs/2502.12693) for the full
+detector setup.*
